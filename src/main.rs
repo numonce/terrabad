@@ -3,7 +3,9 @@ use reqwest::{
     blocking::ClientBuilder,
     header::{HeaderMap, HeaderValue, COOKIE},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Map;
+use serde_json::Value;
 use std::{collections::HashMap, error::Error};
 
 #[derive(Deserialize, Debug)]
@@ -86,6 +88,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .help("Last VMID for range. Needed for bulk actions.")
                 .required_if_eq_any([("Action", "bulk_clone")]),
         )
+        .arg(
+            Arg::new("Clone_type")
+                .long("clone_type")
+                .short('t')
+                .help("Type of clone. Can either be linked or full.")
+                .default_value("linked")
+                .value_parser(["linked", "full"]),
+        )
         .get_matches();
     match app.get_one::<String>("Action").unwrap().as_str() {
         "clone" => create_clone(app)?,
@@ -124,10 +134,15 @@ fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let dst = app.get_one::<String>("Destination").unwrap();
     let src = app.get_one::<String>("Source").unwrap();
     let url = app.get_one::<String>("Url").unwrap();
+    let clone_type = app.get_one::<String>("Clone_type").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
     let token = get_token(&mut username.clone(), password, url)?;
-
+    let full = match clone_type.as_str() {
+        "linked" => false,
+        "full" => true,
+        _ => false,
+    };
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -138,10 +153,14 @@ fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         "Csrfpreventiontoken",
         HeaderValue::from_str(token.data.csrf.as_str())?,
     );
-    let mut json_data = HashMap::new();
-    json_data.insert("newid", dst.clone().to_owned());
-    json_data.insert("node", name.clone().to_owned());
-    json_data.insert("vmid", src.clone().to_owned());
+    let mut json_data = Map::new();
+    json_data.insert("newid".to_string(), Value::String(dst.to_owned()));
+    json_data.insert("node".to_string(), Value::String(name.to_owned()));
+    json_data.insert(
+        "vmid".to_string(),
+        serde_json::Value::String(src.to_owned()),
+    );
+    json_data.insert("full".to_string(), Value::Bool(full));
     let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, name, src);
     let text = client
         .post(n_url)
