@@ -47,20 +47,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .short('a')
                 .help("clone, etc...")
                 .required(true)
-                .value_parser(["clone", "remove"]),
+                .value_parser(["clone", "remove", "bulk_clone", "bulk_destroy"]),
         )
         .arg(
             Arg::new("Name")
                 .long("name")
                 .short('n')
-                .requires("Action")
+                .required(true)
                 .help("Name of the node"),
         )
         .arg(
             Arg::new("Source")
                 .long("source")
                 .short('s')
-                .requires("Action")
+                .required(true)
                 .help("Source template VMID for action."),
         )
         .arg(
@@ -70,10 +70,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .requires("Action")
                 .help("Destination template VMID for action."),
         )
+        .arg(
+            Arg::new("Min")
+                .long("min")
+                .short('m')
+                .requires("Action")
+                .help("First VMID for range. Needed for bulk actions.")
+                .required_if_eq_any([("Action", "bulk_clone")]),
+        )
+        .arg(
+            Arg::new("Max")
+                .long("max")
+                .short('M')
+                .requires("Action")
+                .help("Last VMID for range. Needed for bulk actions.")
+                .required_if_eq_any([("Action", "bulk_clone")]),
+        )
         .get_matches();
     match app.get_one::<String>("Action").unwrap().as_str() {
         "clone" => create_clone(app)?,
         "remove" => remove_vm(app)?,
+        "bulk_clone" => bulk_clone(app)?,
+        "bulk_destroy" => bulk_destroy(app)?,
         _ => panic!("asdfasdf"),
     }
     Ok(())
@@ -159,5 +177,72 @@ fn remove_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .send()?
         .text()?;
     println!("{:?}", text);
+    Ok(())
+}
+fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
+    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let name = app.get_one::<String>("Name").unwrap();
+    let src = app.get_one::<String>("Source").unwrap();
+    let url = app.get_one::<String>("Url").unwrap();
+    let username = app.get_one::<String>("Username").unwrap();
+    let password = app.get_one::<String>("Password").unwrap();
+    let token = get_token(&mut username.clone(), password, url)?;
+
+    let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, name, src);
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
+    headers.insert(
+        "Csrfpreventiontoken",
+        HeaderValue::from_str(token.data.csrf.as_str())?,
+    );
+    for i in min..max + 1 {
+        let mut json_data = HashMap::new();
+        json_data.insert("newid", i.to_string());
+        json_data.insert("node", name.clone().to_owned());
+        json_data.insert("vmid", src.clone().to_owned());
+        client
+            .post(&n_url)
+            .headers(headers.clone())
+            .json(&json_data)
+            .send()?
+            .text()?;
+        println!("VMID {} created", i);
+        println!("Waiting...");
+        //std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
+    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let name = app.get_one::<String>("Name").unwrap();
+    let url = app.get_one::<String>("Url").unwrap();
+    let username = app.get_one::<String>("Username").unwrap();
+    let password = app.get_one::<String>("Password").unwrap();
+    let token = get_token(&mut username.clone(), password, url)?;
+    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
+    headers.insert(
+        "Csrfpreventiontoken",
+        HeaderValue::from_str(token.data.csrf.as_str())?,
+    );
+    for i in min..max + 1 {
+        let n_url = format!("{}/api2/json/nodes/{}/qemu/{}", url, name, i.to_string());
+        client
+            .delete(n_url)
+            .headers(headers.clone())
+            .send()?
+            .text()?;
+        println!("VMID {} destroyed", i);
+    }
     Ok(())
 }
