@@ -3,13 +3,13 @@ use reqwest::{
     blocking::ClientBuilder,
     header::{HeaderMap, HeaderValue, COOKIE},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use std::{collections::HashMap, error::Error};
 
 #[derive(Deserialize, Debug)]
-struct Data {
+struct TokenData {
     data: Token,
 }
 
@@ -18,6 +18,19 @@ struct Token {
     ticket: String,
     #[serde(rename = "CSRFPreventionToken")]
     csrf: String,
+}
+#[derive(Deserialize, Debug)]
+struct UPIDData {
+    data: String,
+}
+#[derive(Deserialize, Debug)]
+struct JobData {
+    data: Job,
+}
+
+#[derive(Deserialize, Debug)]
+struct Job {
+    exitstatus: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -111,7 +124,7 @@ fn get_token(
     username: &mut String,
     password: &String,
     url: &String,
-) -> Result<Data, Box<dyn Error>> {
+) -> Result<TokenData, Box<dyn Error>> {
     username.push_str("@pam");
     let mut json_data = HashMap::new();
     let user_slice = &username[..];
@@ -124,7 +137,7 @@ fn get_token(
         .build()?;
     let url = format!("{}/api2/json/access/ticket", &url);
     let text = client.post(url).json(&json_data).send()?.text()?;
-    let token: Data = serde_json::de::from_str::<Data>(&text)?;
+    let token: TokenData = serde_json::de::from_str::<TokenData>(&text)?;
 
     Ok(token)
 }
@@ -168,7 +181,8 @@ fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .json(&json_data)
         .send()?
         .text()?;
-    println!("{}", text);
+    let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
+    finished(headers, upid, url, name)?;
     Ok(())
 }
 
@@ -224,15 +238,14 @@ fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         json_data.insert("newid", i.to_string());
         json_data.insert("node", name.clone().to_owned());
         json_data.insert("vmid", src.clone().to_owned());
-        client
+        let text = client
             .post(&n_url)
             .headers(headers.clone())
             .json(&json_data)
             .send()?
             .text()?;
-        println!("VMID {} created", i);
-        println!("Waiting...");
-        //std::thread::sleep(std::time::Duration::from_millis(500));
+        let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
+        finished(headers.clone(), upid, url, name)?;
     }
     Ok(())
 }
@@ -263,5 +276,39 @@ fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             .text()?;
         println!("VMID {} destroyed", i);
     }
+    Ok(())
+}
+
+fn finished(
+    headers: HeaderMap,
+    upid: UPIDData,
+    url: &String,
+    name: &String,
+) -> Result<(), Box<dyn Error>> {
+    let n_url = format!(
+        "{}/api2/json/nodes/{}/tasks/{}/status",
+        url, name, upid.data
+    );
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    loop {
+        let resp = client
+            .get(n_url.clone())
+            .headers(headers.clone())
+            .send()?
+            .text()?;
+        let job_details = match serde_json::de::from_str::<JobData>(resp.as_str()) {
+            Ok(jobdata) => jobdata,
+            Err(_) => continue,
+        };
+        if job_details.data.exitstatus == String::from("OK") {
+            println!("Finished!");
+            break;
+        } else {
+            println!("{}", job_details.data.exitstatus);
+        }
+    }
+
     Ok(())
 }
