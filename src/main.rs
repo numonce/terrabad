@@ -1,12 +1,11 @@
 use clap::{Arg, ArgMatches, Command};
-use reqwest::{
-    blocking::ClientBuilder,
-    header::{HeaderMap, HeaderValue, COOKIE},
-};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
-use std::{collections::HashMap, error::Error};
+use std::{collections::HashMap, error::Error, sync::Arc};
+use tokio::sync::Semaphore;
 
 #[derive(Deserialize, Debug)]
 struct TokenData {
@@ -32,8 +31,8 @@ struct JobData {
 struct Job {
     exitstatus: String,
 }
-
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let app = Command::new("terrabad")
         .arg(
             Arg::new("Url")
@@ -62,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .short('a')
                 .help("clone, etc...")
                 .required(true)
-                .value_parser(["clone", "remove", "bulk_clone", "bulk_destroy"]),
+                .value_parser(["clone", "destroy", "bulk_clone", "bulk_destroy"]),
         )
         .arg(
             Arg::new("Name")
@@ -111,16 +110,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .get_matches();
     match app.get_one::<String>("Action").unwrap().as_str() {
-        "clone" => create_clone(app)?,
-        "remove" => remove_vm(app)?,
-        "bulk_clone" => bulk_clone(app)?,
-        "bulk_destroy" => bulk_destroy(app)?,
+        "clone" => create_clone(app).await?,
+        "destroy" => destroy_vm(app).await?,
+        "bulk_clone" => bulk_clone(app).await?,
+        "bulk_destroy" => bulk_destroy(app).await?,
         _ => panic!("asdfasdf"),
     }
     Ok(())
 }
 
-fn get_token(
+async fn get_token(
     username: &mut String,
     password: &String,
     url: &String,
@@ -136,13 +135,19 @@ fn get_token(
         .danger_accept_invalid_certs(true)
         .build()?;
     let url = format!("{}/api2/json/access/ticket", &url);
-    let text = client.post(url).json(&json_data).send()?.text()?;
+    let text = client
+        .post(url)
+        .json(&json_data)
+        .send()
+        .await?
+        .text()
+        .await?;
     let token: TokenData = serde_json::de::from_str::<TokenData>(&text)?;
 
     Ok(token)
 }
 
-fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let name = app.get_one::<String>("Name").unwrap();
     let dst = app.get_one::<String>("Destination").unwrap();
     let src = app.get_one::<String>("Source").unwrap();
@@ -150,7 +155,7 @@ fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let clone_type = app.get_one::<String>("Clone_type").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url)?;
+    let token = get_token(&mut username.clone(), password, url).await?;
     let full = match clone_type.as_str() {
         "linked" => false,
         "full" => true,
@@ -179,14 +184,16 @@ fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .post(n_url)
         .headers(headers.clone())
         .json(&json_data)
-        .send()?
-        .text()?;
+        .send()
+        .await?
+        .text()
+        .await?;
     let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-    finished(headers, upid, url, name)?;
+    finished(headers, upid, url, name).await?;
     Ok(())
 }
 
-fn remove_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -195,7 +202,7 @@ fn remove_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let url = app.get_one::<String>("Url").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url)?;
+    let token = get_token(&mut username.clone(), password, url).await?;
     let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
@@ -207,12 +214,15 @@ fn remove_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let text = client
         .delete(n_url)
         .headers(headers.clone())
-        .send()?
-        .text()?;
-    println!("{:?}", text);
+        .send()
+        .await?
+        .text()
+        .await?;
+    let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
+    finished(headers, upid, url, name).await?;
     Ok(())
 }
-fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
     let name = app.get_one::<String>("Name").unwrap();
@@ -220,10 +230,14 @@ fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let url = app.get_one::<String>("Url").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url)?;
-
+    let token = get_token(&mut username.clone(), password, url).await?;
+    let full = match app.get_one::<String>("Clone_type").unwrap().as_str() {
+        "linked" => false,
+        "full" => true,
+        _ => false,
+    };
     let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, name, src);
-    let client = ClientBuilder::new()
+    let client = reqwest::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
     let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
@@ -233,23 +247,50 @@ fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         "Csrfpreventiontoken",
         HeaderValue::from_str(token.data.csrf.as_str())?,
     );
-    for i in min..max + 1 {
-        let mut json_data = HashMap::new();
-        json_data.insert("newid", i.to_string());
-        json_data.insert("node", name.clone().to_owned());
-        json_data.insert("vmid", src.clone().to_owned());
-        let text = client
-            .post(&n_url)
-            .headers(headers.clone())
-            .json(&json_data)
-            .send()?
-            .text()?;
-        let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-        finished(headers.clone(), upid, url, name)?;
+
+    let semaphore = Arc::new(Semaphore::new(2));
+    let jobs: Vec<_> = (min..max + 1).collect();
+    let tasks: Vec<_> = jobs
+        .into_iter()
+        .map(|newid| {
+            let permit = semaphore.clone();
+            let mut json_data = Map::new();
+            json_data.insert(String::from("newid"), Value::String(newid.to_string()));
+            json_data.insert(String::from("node"), Value::String(name.clone()));
+            json_data.insert(String::from("vmid"), Value::String(src.clone()));
+            json_data.insert(String::from("full"), Value::Bool(full.clone()));
+            let url = url.clone();
+            let client = client.clone();
+            let src = src.clone();
+            let name = name.clone();
+            let n_url = n_url.clone();
+            let headers = headers.clone();
+            tokio::spawn(async move {
+                let _permit = permit.acquire().await.unwrap();
+                let text = client
+                    .clone()
+                    .post(n_url)
+                    .headers(headers.clone())
+                    .json(&json_data.clone())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                finished(headers.clone(), upid, &url, &name).await.unwrap();
+                println!("VMID {} cloned from {}", newid, src);
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await?;
     }
+
     Ok(())
 }
-fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
+async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
     let client = ClientBuilder::new()
@@ -259,7 +300,7 @@ fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let url = app.get_one::<String>("Url").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url)?;
+    let token = get_token(&mut username.clone(), password, url).await?;
     let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
@@ -267,19 +308,48 @@ fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         "Csrfpreventiontoken",
         HeaderValue::from_str(token.data.csrf.as_str())?,
     );
-    for i in min..max + 1 {
-        let n_url = format!("{}/api2/json/nodes/{}/qemu/{}", url, name, i.to_string());
-        client
-            .delete(n_url)
-            .headers(headers.clone())
-            .send()?
-            .text()?;
-        println!("VMID {} destroyed", i);
+
+    let semaphore = Arc::new(Semaphore::new(2));
+    let jobs: Vec<_> = (min..max + 1).collect();
+    let tasks: Vec<_> = jobs
+        .into_iter()
+        .map(|newid| {
+            let n_url = format!(
+                "{}/api2/json/nodes/{}/qemu/{}",
+                url,
+                name,
+                newid.to_string()
+            );
+            let url = url.clone();
+            let client = client.clone();
+            let name = name.clone();
+            let n_url = n_url.clone();
+            let headers = headers.clone();
+            let permit = semaphore.clone();
+            tokio::spawn(async move {
+                let _permit = permit.acquire().await.unwrap();
+                let text = client
+                    .delete(n_url)
+                    .headers(headers.clone())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                finished(headers.clone(), upid, &url, &name).await.unwrap();
+                println!("VMID {} destroyed", newid.to_string());
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await?;
     }
     Ok(())
 }
 
-fn finished(
+async fn finished(
     headers: HeaderMap,
     upid: UPIDData,
     url: &String,
@@ -296,17 +366,19 @@ fn finished(
         let resp = client
             .get(n_url.clone())
             .headers(headers.clone())
-            .send()?
-            .text()?;
+            .send()
+            .await?
+            .text()
+            .await?;
         let job_details = match serde_json::de::from_str::<JobData>(resp.as_str()) {
             Ok(jobdata) => jobdata,
             Err(_) => continue,
         };
         if job_details.data.exitstatus == String::from("OK") {
-            println!("Finished!");
             break;
-        } else {
-            println!("{}", job_details.data.exitstatus);
+        }
+        if job_details.data.exitstatus == String::from("ERROR") {
+            println!("VMID {:?} {:?}", upid, job_details.data.exitstatus);
         }
     }
 
