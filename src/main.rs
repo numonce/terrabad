@@ -4,6 +4,7 @@ use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::str::FromStr;
 use std::{collections::HashMap, error::Error, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -74,7 +75,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arg::new("Source")
                 .long("source")
                 .short('s')
-                .required(true)
                 .help("Source template VMID for action."),
         )
         .arg(
@@ -150,12 +150,17 @@ async fn get_token(
 async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let name = app.get_one::<String>("Name").unwrap();
     let dst = app.get_one::<String>("Destination").unwrap();
-    let src = app.get_one::<String>("Source").unwrap();
+    let src = app.get_one::<String>("Source");
     let url = app.get_one::<String>("Url").unwrap();
     let clone_type = app.get_one::<String>("Clone_type").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
     let token = get_token(&mut username.clone(), password, url).await?;
+
+    let src = match src {
+        Some(e) => e,
+        None => panic!("The argument requires a source VMID"),
+    };
     let full = match clone_type.as_str() {
         "linked" => false,
         "full" => true,
@@ -198,12 +203,16 @@ async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .danger_accept_invalid_certs(true)
         .build()?;
     let name = app.get_one::<String>("Name").unwrap();
-    let src = app.get_one::<String>("Source").unwrap();
+    let src = app.get_one::<String>("Source");
     let url = app.get_one::<String>("Url").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
     let token = get_token(&mut username.clone(), password, url).await?;
     let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
+    let src = match src {
+        Some(e) => e,
+        None => panic!("The argument requires a source VMID"),
+    };
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
     headers.insert(
@@ -226,11 +235,15 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
     let name = app.get_one::<String>("Name").unwrap();
-    let src = app.get_one::<String>("Source").unwrap();
+    let src = app.get_one::<String>("Source");
     let url = app.get_one::<String>("Url").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
     let token = get_token(&mut username.clone(), password, url).await?;
+    let src = match src {
+        Some(e) => e,
+        None => panic!("The argument requires a source VMID"),
+    };
     let full = match app.get_one::<String>("Clone_type").unwrap().as_str() {
         "linked" => false,
         "full" => true,
@@ -278,7 +291,10 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                     .text()
                     .await
                     .unwrap();
-                let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                let upid = match serde_json::de::from_str::<UPIDData>(text.as_str()) {
+                    Ok(upid) => upid,
+                    Err(e) => panic!("Expected upid, got {:?}", e),
+                };
                 finished(headers.clone(), upid, &url, &name).await.unwrap();
                 println!("VMID {} cloned from {}", newid, src);
             })
@@ -328,18 +344,21 @@ async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let permit = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let text = client
-                    .delete(n_url)
-                    .headers(headers.clone())
-                    .send()
-                    .await
-                    .unwrap()
-                    .text()
-                    .await
-                    .unwrap();
-                let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
-                finished(headers.clone(), upid, &url, &name).await.unwrap();
-                println!("VMID {} destroyed", newid.to_string());
+                let request = match client.delete(&n_url).headers(headers.clone()).send().await {
+                    Ok(c) => c,
+                    Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                };
+                if request.status() == reqwest::StatusCode::from_str("200").unwrap() {
+                    let text = request.text().await.unwrap(); // Same with the aformetioned comment
+                    let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                    finished(headers.clone(), upid, &url, &name).await.unwrap();
+                } else {
+                    println!(
+                        "Server returned: {}. Make sure {} is valid.",
+                        request.status(),
+                        n_url
+                    );
+                }
             })
         })
         .collect();
@@ -376,9 +395,8 @@ async fn finished(
         };
         if job_details.data.exitstatus == String::from("OK") {
             break;
-        }
-        if job_details.data.exitstatus == String::from("ERROR") {
-            println!("VMID {:?} {:?}", upid, job_details.data.exitstatus);
+        } else {
+            println!("{:?}", job_details.data.exitstatus);
         }
     }
 
