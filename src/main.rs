@@ -1,24 +1,13 @@
+mod auth;
 use clap::{Arg, ArgMatches, Command};
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use reqwest::header::HeaderMap;
 use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use std::str::FromStr;
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 use tokio::sync::Semaphore;
-
-#[derive(Deserialize, Debug)]
-struct TokenData {
-    data: Token,
-}
-
-#[derive(Deserialize, Debug)]
-struct Token {
-    ticket: String,
-    #[serde(rename = "CSRFPreventionToken")]
-    csrf: String,
-}
 #[derive(Deserialize, Debug)]
 struct UPIDData {
     data: String,
@@ -32,43 +21,18 @@ struct JobData {
 struct Job {
     exitstatus: String,
 }
-async fn get_token(
-    username: &mut String,
-    password: &String,
-    url: &String,
-) -> Result<TokenData, Box<dyn Error>> {
-    username.push_str("@pam");
-    let mut json_data = HashMap::new();
-    let user_slice = &username[..];
-    let pass_slice = &password[..];
-    json_data.insert("username", user_slice);
-    json_data.insert("password", pass_slice);
-
-    let client = ClientBuilder::new()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let url = format!("{}/api2/json/access/ticket", &url);
-    let text = client
-        .post(url)
-        .json(&json_data)
-        .send()
-        .await?
-        .text()
-        .await?;
-    let token: TokenData = serde_json::de::from_str::<TokenData>(&text)?;
-
-    Ok(token)
-}
-
 async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let nodename = app.get_one::<String>("Node").unwrap();
     let dst = app.get_one::<String>("Destination").unwrap();
     let src = app.get_one::<String>("Source");
-    let url = app.get_one::<String>("Url").unwrap();
+    let mut url = app.get_one::<String>("Url").unwrap().to_owned();
+    if url.ends_with('/') {
+        url.pop();
+    }
     let clone_type = app.get_one::<String>("Clone_type").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url).await?;
+    let token = auth::get_token(&mut username.clone(), password, &url).await?;
     let name = app.get_one::<String>("Name");
 
     let name = match name {
@@ -88,13 +52,6 @@ async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
-    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
-    let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
-    headers.insert(
-        "Csrfpreventiontoken",
-        HeaderValue::from_str(token.data.csrf.as_str())?,
-    );
     let mut json_data = Map::new();
     if name != "" {
         json_data.insert("name".to_string(), Value::String(name.to_owned()));
@@ -109,14 +66,14 @@ async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
     let text = client
         .post(n_url)
-        .headers(headers.clone())
+        .headers(token.clone())
         .json(&json_data)
         .send()
         .await?
         .text()
         .await?;
     let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-    finished(headers, upid, url, nodename).await?;
+    finished(token, upid, &url, nodename).await?;
     Ok(())
 }
 
@@ -126,31 +83,27 @@ async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .build()?;
     let name = app.get_one::<String>("Node").unwrap();
     let src = app.get_one::<String>("Source");
-    let url = app.get_one::<String>("Url").unwrap();
+    let mut url = app.get_one::<String>("Url").unwrap().to_owned();
+    if url.ends_with('/') {
+        url.pop();
+    }
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url).await?;
-    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
+    let token = auth::get_token(&mut username.clone(), password, &url).await?;
     let src = match src {
         Some(e) => e,
         None => panic!("The argument requires a source VMID"),
     };
-    let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
-    headers.insert(
-        "Csrfpreventiontoken",
-        HeaderValue::from_str(token.data.csrf.as_str())?,
-    );
     let n_url = format!("{}/api2/json/nodes/{}/qemu/{}", url, name, src);
     let text = client
         .delete(n_url)
-        .headers(headers.clone())
+        .headers(token.clone())
         .send()
         .await?
         .text()
         .await?;
     let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-    finished(headers, upid, url, name).await?;
+    finished(token, upid, &url, name).await?;
     Ok(())
 }
 async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
@@ -158,10 +111,13 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
     let nodename = app.get_one::<String>("Node").unwrap();
     let src = app.get_one::<String>("Source");
-    let url = app.get_one::<String>("Url").unwrap();
+    let mut url = app.get_one::<String>("Url").unwrap().to_owned();
+    if url.ends_with('/') {
+        url.pop();
+    }
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url).await?;
+    let token = auth::get_token(&mut username.clone(), password, &url).await?;
     let name = app.get_one::<String>("Name");
 
     let name = match name {
@@ -181,13 +137,6 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = reqwest::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
-    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
-    let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
-    headers.insert(
-        "Csrfpreventiontoken",
-        HeaderValue::from_str(token.data.csrf.as_str())?,
-    );
 
     let semaphore = Arc::new(Semaphore::new(
         app.get_one::<String>("Threads").unwrap().parse::<usize>()?,
@@ -211,13 +160,13 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let src = src.clone();
             let name = nodename.clone();
             let n_url = n_url.clone();
-            let headers = headers.clone();
+            let token = token.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
                 let text = client
                     .clone()
                     .post(n_url)
-                    .headers(headers.clone())
+                    .headers(token.clone())
                     .json(&json_data.clone())
                     .send()
                     .await
@@ -229,7 +178,7 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                     Ok(upid) => upid,
                     Err(e) => panic!("Expected upid, got {:?}", e),
                 };
-                finished(headers.clone(), upid, &url, &name).await.unwrap();
+                finished(token.clone(), upid, &url, &name).await.unwrap();
                 println!("VMID {} cloned from {}", newid, src);
             })
         })
@@ -247,18 +196,13 @@ async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .danger_accept_invalid_certs(true)
         .build()?;
     let name = app.get_one::<String>("Node").unwrap();
-    let url = app.get_one::<String>("Url").unwrap();
+    let mut url = app.get_one::<String>("Url").unwrap().to_owned();
+    if url.ends_with('/') {
+        url.pop();
+    }
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = get_token(&mut username.clone(), password, url).await?;
-    let new_cookie = format!("PVEAuthCookie={}", token.data.ticket);
-    let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(new_cookie.as_str())?);
-    headers.insert(
-        "Csrfpreventiontoken",
-        HeaderValue::from_str(token.data.csrf.as_str())?,
-    );
-
+    let token = auth::get_token(&mut username.clone(), password, &url).await?;
     let semaphore = Arc::new(Semaphore::new(
         app.get_one::<String>("Threads").unwrap().parse::<usize>()?,
     ));
@@ -276,18 +220,18 @@ async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let client = client.clone();
             let name = name.clone();
             let n_url = n_url.clone();
-            let headers = headers.clone();
+            let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let request = match client.delete(&n_url).headers(headers.clone()).send().await {
+                let request = match client.delete(&n_url).headers(token.clone()).send().await {
                     Ok(c) => c,
                     Err(_) => panic!("Encountered an error. Does the VMID exist?"),
                 };
                 if request.status() == reqwest::StatusCode::from_str("200").unwrap() {
                     let text = request.text().await.unwrap(); // Same with the aformetioned comment
                     let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
-                    finished(headers.clone(), upid, &url, &name).await.unwrap();
+                    finished(token.clone(), upid, &url, &name).await.unwrap();
                     println!("{} destroyed", newid);
                 } else {
                     println!(
@@ -434,7 +378,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "destroy" => destroy_vm(app).await?,
         "bulk_clone" => bulk_clone(app).await?,
         "bulk_destroy" => bulk_destroy(app).await?,
-        _ => panic!("asdfasdf"),
+        _ => panic!("Something incredibly bad occured if you can see this."),
     }
     Ok(())
 }
