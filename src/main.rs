@@ -5,7 +5,6 @@ use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
-use std::str::FromStr;
 use std::{error::Error, sync::Arc};
 use tokio::sync::Semaphore;
 #[derive(Deserialize, Debug)]
@@ -63,17 +62,35 @@ async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         serde_json::Value::String(src.to_owned()),
     );
     json_data.insert("full".to_string(), Value::Bool(full));
-    let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
-    let text = client
-        .post(n_url)
+    let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/clone", url, nodename, src);
+    let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
+    let qemu_response = client
+        .post(qemu_url)
         .headers(token.clone())
         .json(&json_data)
         .send()
-        .await?
-        .text()
         .await?;
-    let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-    finished(token, upid, &url, nodename).await?;
+    if qemu_response.status() == 200 {
+        let upid: UPIDData =
+            serde_json::de::from_str::<UPIDData>(qemu_response.text().await?.as_str())?;
+        finished(token, upid, &url, nodename).await?;
+    } else {
+        json_data.remove("full");
+        json_data.insert("full".to_string(), Value::Bool(true));
+        let lxc_response = client
+            .post(lxc_url)
+            .headers(token.clone())
+            .json(&json_data)
+            .send()
+            .await?;
+        if lxc_response.status() != 200 {
+            println!("Unable to clone target. Check arguments and permissions.")
+        } else {
+            let upid: UPIDData =
+                serde_json::de::from_str::<UPIDData>(lxc_response.text().await?.as_str())?;
+            finished(token, upid, &url, nodename).await?;
+        }
+    }
     Ok(())
 }
 
@@ -81,7 +98,8 @@ async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
-    let name = app.get_one::<String>("Node").unwrap();
+    let nodename = app.get_one::<String>("Node").unwrap();
+
     let src = app.get_one::<String>("Source");
     let mut url = app.get_one::<String>("Url").unwrap().to_owned();
     if url.ends_with('/') {
@@ -94,16 +112,27 @@ async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         Some(e) => e,
         None => panic!("The argument requires a source VMID"),
     };
-    let n_url = format!("{}/api2/json/nodes/{}/qemu/{}", url, name, src);
-    let text = client
-        .delete(n_url)
+    let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}", url, nodename, src);
+    let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}", url, nodename, src);
+    let qemu_response = client
+        .delete(qemu_url)
         .headers(token.clone())
         .send()
-        .await?
-        .text()
         .await?;
-    let upid: UPIDData = serde_json::de::from_str::<UPIDData>(text.as_str())?;
-    finished(token, upid, &url, name).await?;
+    if qemu_response.status() == 200 {
+        let upid: UPIDData =
+            serde_json::de::from_str::<UPIDData>(qemu_response.text().await?.as_str())?;
+        finished(token, upid, &url, nodename).await?;
+    } else {
+        let lxc_response = client.delete(lxc_url).headers(token.clone()).send().await?;
+        if lxc_response.status() != 200 {
+            println!("Unable to clone target. Check arguments and permissions.")
+        } else {
+            let upid: UPIDData =
+                serde_json::de::from_str::<UPIDData>(lxc_response.text().await?.as_str())?;
+            finished(token, upid, &url, nodename).await?;
+        }
+    }
     Ok(())
 }
 async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
@@ -119,7 +148,6 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let password = app.get_one::<String>("Password").unwrap();
     let token = auth::get_token(&mut username.clone(), password, &url).await?;
     let name = app.get_one::<String>("Name");
-
     let name = match name {
         Some(n) => n,
         None => "",
@@ -133,7 +161,8 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         "full" => true,
         _ => false,
     };
-    let n_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
+    let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
+    let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/clone", url, nodename, src);
     let client = reqwest::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -147,9 +176,9 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .map(|newid| {
             let permit = semaphore.clone();
             let mut json_data = Map::new();
+            let mut temp_name = String::new();
             if name != "" {
-                let temp_name = format!("{}{}", name, (newid - min));
-                json_data.insert(String::from("name"), Value::String(temp_name));
+                temp_name = format!("{}{}", name, (newid - min));
             }
             json_data.insert(String::from("newid"), Value::String(newid.to_string()));
             json_data.insert(String::from("node"), Value::String(nodename.clone()));
@@ -158,35 +187,59 @@ async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let url = url.clone();
             let client = client.clone();
             let src = src.clone();
-            let name = nodename.clone();
-            let n_url = n_url.clone();
+            let temp_name = temp_name.clone();
+            let nodename = nodename.clone();
+            let qemu_url = qemu_url.clone();
+            let lxc_url = lxc_url.clone();
             let token = token.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let text = client
+                json_data.insert("name".to_string(), Value::String(temp_name.to_string()));
+                let qemu_response = client
                     .clone()
-                    .post(n_url)
+                    .post(qemu_url)
                     .headers(token.clone())
                     .json(&json_data.clone())
                     .send()
                     .await
-                    .unwrap()
-                    .text()
-                    .await
                     .unwrap();
-                let upid = match serde_json::de::from_str::<UPIDData>(text.as_str()) {
-                    Ok(upid) => upid,
-                    Err(e) => panic!("Expected upid, got {:?}", e),
-                };
-                finished(token.clone(), upid, &url, &name).await.unwrap();
-                println!("VMID {} cloned from {}", newid, src);
+
+                if qemu_response.status() == 200 {
+                    let upid: UPIDData = serde_json::de::from_str::<UPIDData>(
+                        qemu_response.text().await.unwrap().as_str(),
+                    )
+                    .unwrap();
+                    finished(token, upid, &url, &nodename).await.unwrap();
+                    println!("VMID {} cloned from {}", newid, src);
+                } else {
+                    json_data.remove("full");
+                    json_data.remove("name");
+                    json_data.insert("full".to_string(), Value::Bool(true));
+                    json_data.insert("hostname".to_string(), Value::String(temp_name.to_string()));
+                    let lxc_response = client
+                        .post(lxc_url)
+                        .headers(token.clone())
+                        .json(&json_data)
+                        .send()
+                        .await
+                        .unwrap();
+                    if lxc_response.status() != 200 {
+                        println!("Unable to clone target. Check arguments and permissions.")
+                    } else {
+                        let upid: UPIDData = serde_json::de::from_str::<UPIDData>(
+                            lxc_response.text().await.unwrap().as_str(),
+                        )
+                        .unwrap();
+                        finished(token, upid, &url, &nodename).await.unwrap();
+                        println!("VMID {} cloned from {}", newid, src);
+                    }
+                }
             })
         })
         .collect();
     for task in tasks {
         task.await?;
     }
-
     Ok(())
 }
 async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
@@ -210,35 +263,46 @@ async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let tasks: Vec<_> = jobs
         .into_iter()
         .map(|newid| {
-            let n_url = format!(
+            let qemu_url = format!(
                 "{}/api2/json/nodes/{}/qemu/{}",
                 url,
                 name,
                 newid.to_string()
             );
+            let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}", url, name, newid.to_string());
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
-            let n_url = n_url.clone();
+            let qemu_url = qemu_url.clone();
+            let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let request = match client.delete(&n_url).headers(token.clone()).send().await {
-                    Ok(c) => c,
-                    Err(_) => panic!("Encountered an error. Does the VMID exist?"),
-                };
-                if request.status() == reqwest::StatusCode::from_str("200").unwrap() {
-                    let text = request.text().await.unwrap(); // Same with the aformetioned comment
+                let qemu_request =
+                    match client.delete(&qemu_url).headers(token.clone()).send().await {
+                        Ok(c) => c,
+                        Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                    };
+                if qemu_request.status() == 200 {
+                    let text = qemu_request.text().await.unwrap(); // Same with the aformetioned comment
                     let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
                     finished(token.clone(), upid, &url, &name).await.unwrap();
                     println!("{} destroyed", newid);
                 } else {
-                    println!(
-                        "Server returned: {}. Make sure {} is valid.",
-                        request.status(),
-                        n_url
-                    );
+                    let lxc_request =
+                        match client.delete(&lxc_url).headers(token.clone()).send().await {
+                            Ok(c) => c,
+                            Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                        };
+                    if lxc_request.status() == 200 {
+                        let text = lxc_request.text().await.unwrap(); // Same with the aformetioned comment
+                        let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                        finished(token.clone(), upid, &url, &name).await.unwrap();
+                        println!("{} destroyed", newid);
+                    } else {
+                        println!("An error occured in destroying {}\nThis is usually resolved by trying again.",newid);
+                    }
                 }
             })
         })
@@ -370,7 +434,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .long("threads")
                 .short('t')
                 .help("Number of workers.")
-                .default_value("3"),
+                .default_value("1"),
         )
         .get_matches();
     match app.get_one::<String>("Action").unwrap().as_str() {
