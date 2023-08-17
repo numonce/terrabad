@@ -221,7 +221,9 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let token = token.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                json_data.insert("name".to_string(), Value::String(temp_name.to_string()));
+                if temp_name != "" {
+                    json_data.insert("name".to_string(), Value::String(temp_name.to_string()));
+                }
                 let qemu_response = client
                     .clone()
                     .post(qemu_url)
