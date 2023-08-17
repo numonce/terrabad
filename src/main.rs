@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .long("node")
                 .short('N')
                 .required(true)
-                .help("Node of the node"),
+                .help("Name of the node"),
         )
         .arg(
             Arg::new("Source")
@@ -65,7 +65,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .long("destination")
                 .short('d')
                 .requires("Action")
-                .help("Destination template VMID for action."),
+                .help(
+                    "Destination template VMID for action. This is only needed for single actions.",
+                ),
         )
         .arg(
             Arg::new("Min")

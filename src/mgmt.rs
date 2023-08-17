@@ -6,10 +6,20 @@ use serde_json::Map;
 use serde_json::Value;
 use std::{error::Error, sync::Arc};
 use tokio::sync::Semaphore;
+
+//This struct is simply used to handle instances when the api returns "Data":null.
+#[derive(Deserialize)]
+pub struct NULLData {
+    data: Option<String>,
+}
+//This struct is to handle the upid, which is the unique identifier proxmox returns when you
+//submit a job.
 #[derive(Deserialize, Debug)]
 pub struct UPIDData {
     data: String,
 }
+//The next two structs handle the query of a job via the aformetioned upid. Since it returns a key
+//with key pairs we have to build a struct the feeds into a struct.
 #[derive(Deserialize, Debug)]
 pub struct JobData {
     pub data: Job,
@@ -19,26 +29,31 @@ pub struct JobData {
 pub struct Job {
     pub exitstatus: String,
 }
+//This functions creates single clones.
 pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let nodename = app.get_one::<String>("Node").unwrap();
     let dst = app.get_one::<String>("Destination").unwrap();
     let src = app.get_one::<String>("Source");
-    let mut url = app.get_one::<String>("Url").unwrap().to_owned();
+    let mut url = app.get_one::<String>("Url").unwrap().to_owned(); //Handles the format of https://proxmox/ vs https://proxmox
     if url.ends_with('/') {
         url.pop();
     }
     let clone_type = app.get_one::<String>("Clone_type").unwrap();
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = crate::auth::get_token(&mut username.clone(), password, &url).await?;
+    //Grabs a headermap with the pvecookie and csrfprevention token.
+    let token = super::auth::get_token(&mut username.clone(), password, &url).await?;
     let name = app.get_one::<String>("Name");
 
     let name = match name {
+        //This handles the optional parameter of naming the new cloned vm.
         Some(n) => n,
         None => "",
     };
 
     let src = match src {
+        //This is a way to make this parameter a requirement for this function,
+        //but not the whole program.
         Some(e) => e,
         None => panic!("The argument requires a source VMID"),
     };
@@ -48,8 +63,9 @@ pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         _ => false,
     };
     let client = ClientBuilder::new()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(true) //Allows us to ignore the invalid ssl cert
         .build()?;
+    //Using the Map and Value structs from serde_json allows us to have a hashmap with mixed data types.
     let mut json_data = Map::new();
     if name != "" {
         json_data.insert("name".to_string(), Value::String(name.to_owned()));
@@ -61,6 +77,8 @@ pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         serde_json::Value::String(src.to_owned()),
     );
     json_data.insert("full".to_string(), Value::Bool(full));
+    //The below code sends between 1-2 requests. It doesn't actually implement a way to determine
+    //if the src template is lxc or qemu.
     let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/clone", url, nodename, src);
     let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
     let qemu_response = client
@@ -70,10 +88,15 @@ pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         .send()
         .await?;
     if qemu_response.status() == 200 {
+        //Takes the upid returned by the submitted job and sends it to a function that returns when
+        //the job is finished or errs.
         let upid: UPIDData =
             serde_json::de::from_str::<UPIDData>(qemu_response.text().await?.as_str())?;
         finished(token, upid, &url, nodename).await?;
     } else {
+        //LCXs can only be single threaded and full cloned at the moment. So pop the clone type
+        //here and replace it with a full clone. Doesn't implement a check for the number of
+        //threads tho.
         json_data.remove("full");
         json_data.insert("full".to_string(), Value::Bool(true));
         let lxc_response = client
@@ -88,11 +111,12 @@ pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let upid: UPIDData =
                 serde_json::de::from_str::<UPIDData>(lxc_response.text().await?.as_str())?;
             finished(token, upid, &url, nodename).await?;
+            println!("VMID {} cloned from {}", dst, src);
         }
     }
     Ok(())
 }
-
+//This function does much of the same thing as the last one, sends a delete and doesn't send json.
 pub async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
@@ -106,7 +130,7 @@ pub async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     }
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = crate::auth::get_token(&mut username.clone(), password, &url).await?;
+    let token = super::auth::get_token(&mut username.clone(), password, &url).await?;
     let src = match src {
         Some(e) => e,
         None => panic!("The argument requires a source VMID"),
@@ -125,15 +149,18 @@ pub async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     } else {
         let lxc_response = client.delete(lxc_url).headers(token.clone()).send().await?;
         if lxc_response.status() != 200 {
-            println!("Unable to clone target. Check arguments and permissions.")
+            println!("Unable to destroy target. Check arguments and permissions.")
         } else {
             let upid: UPIDData =
                 serde_json::de::from_str::<UPIDData>(lxc_response.text().await?.as_str())?;
             finished(token, upid, &url, nodename).await?;
+            println!("{} destroyed.", src);
         }
     }
     Ok(())
 }
+//This does much of the same stuff as create_clone, but uses tokio to thread and send requests
+//async.
 pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
@@ -145,7 +172,7 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     }
     let username = app.get_one::<String>("Username").unwrap();
     let password = app.get_one::<String>("Password").unwrap();
-    let token = crate::auth::get_token(&mut username.clone(), password, &url).await?;
+    let token = super::auth::get_token(&mut username.clone(), password, &url).await?;
     let name = app.get_one::<String>("Name");
     let name = match name {
         Some(n) => n,
@@ -165,11 +192,12 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let client = reqwest::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
-
+    //Creates a semaphore to control the amount of concurrent jobs running.
     let semaphore = Arc::new(Semaphore::new(
         app.get_one::<String>("Threads").unwrap().parse::<usize>()?,
     ));
-    let jobs: Vec<_> = (min..max + 1).collect();
+    let jobs: Vec<_> = (min..max + 1).collect(); // Creates a vec of the specified range. Inclusive.
+                                                 //Creates a vec of the jobs needed to be accomplished.
     let tasks: Vec<_> = jobs
         .into_iter()
         .map(|newid| {
@@ -243,6 +271,7 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+//Does much of the same as the aformetioned function, but deletes instead.
 pub async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
@@ -344,41 +373,71 @@ pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                 name,
                 newid.to_string()
             );
-            let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/status/stop", url, name, newid.to_string());
+            //Starting and stopping things returns a upid and a 200 regardless if the vmid supplied
+            //is actually the correct template type to start/stop. So we make a test url to query
+            //with the vmid to determine the type and then send the request based on that.
+            let checker_url = format!("{}/api2/json/nodes/{}/lxc/{}", url, name, newid.to_string());
+            let lxc_url = format!(
+                "{}/api2/json/nodes/{}/lxc/{}/status/stop",
+                url,
+                name,
+                newid.to_string()
+            );
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
+            let checker_url = checker_url.clone();
             let qemu_url = qemu_url.clone();
             let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let qemu_request =
-                    match client.post(&qemu_url).headers(token.clone()).send().await {
-                        Ok(c) => c,
-                        Err(_) => panic!("Encountered an error. Does the VMID exist?"),
-                    };
-                if qemu_request.status() == 200 {
-                    let text = qemu_request.text().await.unwrap(); // Same with the aformetioned comment
-                    let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
-                    finished(token.clone(), upid, &url, &name).await.unwrap();
-                    println!("{} stopped", newid);
-                } else {
-                    let lxc_request =
-                        match client.post(&lxc_url).headers(token.clone()).send().await {
-                            Ok(c) => c,
-                            Err(_) => panic!("Encountered an error. Does the VMID exist?"),
-                        };
-                    if lxc_request.status() == 200 {
-                        let text = lxc_request.text().await.unwrap(); // Same with the aformetioned comment
-                        let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
-                        finished(token.clone(), upid, &url, &name).await.unwrap();
-                        println!("{} destroyed", newid);
-                    } else {
-                        println!("An error occured in stopping {}\nThis is usually resolved by trying again.",newid);
+                //check the type of vm
+                let checker = client
+                    .get(checker_url)
+                    .headers(token.clone())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                match serde_json::de::from_str::<NULLData>(checker.as_str()) {
+                    Ok(_) => {
+                        //If the response can correctly serialize as "Data":Null then we assume
+                        //it's qemu.
+                        let qemu_request =
+                            match client.post(&qemu_url).headers(token.clone()).send().await {
+                                Ok(c) => c,
+                                Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                            };
+                        if qemu_request.status() == 200 {
+                            let text = qemu_request.text().await.unwrap(); // Same with the aformetioned comment
+                            let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                            finished(token.clone(), upid, &url, &name).await.unwrap();
+                            println!("{} stopped", newid);
+                        } else {
+                            println!("Error stopping VMID {}. Does the VM exist?", newid);
+                        }
                     }
-                }
+                    //If the response actually contains data then we assume it's lxc.
+                    Err(_) => {
+                        let lxc_request =
+                            match client.post(&lxc_url).headers(token.clone()).send().await {
+                                Ok(c) => c,
+                                Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                            };
+                        if lxc_request.status() == 200 {
+                            let text = lxc_request.text().await.unwrap(); // Same with the aformetioned comment
+                            let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                            finished(token.clone(), upid, &url, &name).await.unwrap();
+                            println!("{} stopped", newid);
+                        } else {
+                            println!("Error stopping VMID {}. Does the VMID exist?", newid);
+                        }
+                    }
+                };
             })
         })
         .collect();
@@ -387,7 +446,6 @@ pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
-
 pub async fn bulk_start(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
     let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
@@ -415,46 +473,64 @@ pub async fn bulk_start(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                 name,
                 newid.to_string()
             );
-            let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/status/start", url, name, newid.to_string());
+
+            let checker_url = format!("{}/api2/json/nodes/{}/lxc/{}", url, name, newid.to_string());
+            let lxc_url = format!(
+                "{}/api2/json/nodes/{}/lxc/{}/status/start",
+                url,
+                name,
+                newid.to_string()
+            );
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
+            let checker_url = checker_url.clone();
             let qemu_url = qemu_url.clone();
             let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                let qemu_request =
-                    match client.post(&qemu_url).headers(token.clone()).send().await {
-                        Ok(c) => c,
-                        Err(_) => panic!("Encountered an error. Does the VMID exist?"),
-                    };
-                if qemu_request.status() == 200 {
-                    let text = qemu_request.text().await.unwrap();
-                        let upid: UPIDData = match serde_json::de::from_str::<UPIDData>(
-                            text.as_str(),
-                        ) {
-                            Ok(u) => u,
-                            Err(e) => panic!("Program paniced because of {}", e),
-                        };
-                    finished(token.clone(), upid, &url, &name).await.unwrap();
-                    println!("{} started", newid);
-                } else {
-                    let lxc_request =
-                        match client.post(&lxc_url).headers(token.clone()).send().await {
-                            Ok(c) => c,
-                            Err(_) => panic!("Encountered an error. Does the VMID exist?"),
-                        };
-                    if lxc_request.status() == 200 {
-                        let text = lxc_request.text().await.unwrap(); // Same with the aformetioned comment
-                        let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
-                        finished(token.clone(), upid, &url, &name).await.unwrap();
-                        println!("{} destroyed", newid);
-                    } else {
-                        println!("An error occured in destroying {}\nThis is usually resolved by trying again.",newid);
+                //check the type of vm
+                let checker = client
+                    .get(checker_url)
+                    .headers(token.clone())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                match serde_json::de::from_str::<NULLData>(checker.as_str()) {
+                    Ok(_) => {
+                        let qemu_request =
+                            match client.post(&qemu_url).headers(token.clone()).send().await {
+                                Ok(c) => c,
+                                Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                            };
+                        if qemu_request.status() == 200 {
+                            let text = qemu_request.text().await.unwrap(); // Same with the aformetioned comment
+                            let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                            finished(token.clone(), upid, &url, &name).await.unwrap();
+                            println!("{} started", newid);
+                        }
                     }
-                }
+                    Err(_) => {
+                        let lxc_request =
+                            match client.post(&lxc_url).headers(token.clone()).send().await {
+                                Ok(c) => c,
+                                Err(_) => panic!("Encountered an error. Does the VMID exist?"),
+                            };
+                        if lxc_request.status() == 200 {
+                            let text = lxc_request.text().await.unwrap(); // Same with the aformetioned comment
+                            let upid = serde_json::de::from_str::<UPIDData>(text.as_str()).unwrap();
+                            finished(token.clone(), upid, &url, &name).await.unwrap();
+                            println!("{} started", newid);
+                        } else {
+                            println!("Error starting VMID {}. Does the LXC exist?", newid);
+                        }
+                    }
+                };
             })
         })
         .collect();
