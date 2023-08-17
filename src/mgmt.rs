@@ -551,6 +551,7 @@ pub async fn finished(
     url: &String,
     name: &String,
 ) -> Result<(), Box<dyn Error>> {
+    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
     let n_url = format!(
         "{}/api2/json/nodes/{}/tasks/{}/status",
         url, name, upid.data
