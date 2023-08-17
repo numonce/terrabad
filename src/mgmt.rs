@@ -244,7 +244,10 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                     json_data.remove("full");
                     json_data.remove("name");
                     json_data.insert("full".to_string(), Value::Bool(true));
-                    json_data.insert("hostname".to_string(), Value::String(temp_name.to_string()));
+                    if temp_name != "" {
+                        json_data
+                            .insert("hostname".to_string(), Value::String(temp_name.to_string()));
+                    }
                     let lxc_response = client
                         .post(lxc_url)
                         .headers(token.clone())
