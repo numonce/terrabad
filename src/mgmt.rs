@@ -32,7 +32,10 @@ pub struct Job {
 //This functions creates single clones.
 pub async fn create_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let nodename = app.get_one::<String>("Node").unwrap();
-    let dst = app.get_one::<String>("Destination").unwrap();
+    let dst = match app.get_one::<String>("Destination") {
+        Some(n) => n,
+        None => panic!("This action requires a destination VMID"),
+    };
     let src = app.get_one::<String>("Source");
     let mut url = app.get_one::<String>("Url").unwrap().to_owned(); //Handles the format of https://proxmox/ vs https://proxmox
     if url.ends_with('/') {
