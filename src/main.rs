@@ -6,6 +6,9 @@ use std::error::Error;
 async fn main() -> Result<(), Box<dyn Error>> {
     let app =
         Command::new("terrabad")
+            .author("numonce")
+            .about("A tool for managing proxmox functions written in pure rust.")
+            .version("1.0.0")
             .arg(
                 Arg::new("Url")
                     .long("url")

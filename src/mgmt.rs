@@ -165,8 +165,14 @@ pub async fn destroy_vm(app: ArgMatches) -> Result<(), Box<dyn Error>> {
 //This does much of the same stuff as create_clone, but uses tokio to thread and send requests
 //async.
 pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
-    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
-    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let max = match app.get_one::<String>("Max").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Max needs to be a valid VMID"),
+    };
+    let min = match app.get_one::<String>("Min").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Min needs to be a valid VMID"),
+    };
     let nodename = app.get_one::<String>("Node").unwrap();
     let src = app.get_one::<String>("Source");
     let mut url = app.get_one::<String>("Url").unwrap().to_owned();
@@ -190,8 +196,6 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
         "full" => true,
         _ => false,
     };
-    let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
-    let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/clone", url, nodename, src);
     let client = reqwest::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -204,6 +208,8 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     let tasks: Vec<_> = jobs
         .into_iter()
         .map(|newid| {
+            let qemu_url = format!("{}/api2/json/nodes/{}/qemu/{}/clone", url, nodename, src);
+            let lxc_url = format!("{}/api2/json/nodes/{}/lxc/{}/clone", url, nodename, src);
             let permit = semaphore.clone();
             let mut json_data = Map::new();
             let mut temp_name = String::new();
@@ -219,8 +225,6 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let src = src.clone();
             let temp_name = temp_name.clone();
             let nodename = nodename.clone();
-            let qemu_url = qemu_url.clone();
-            let lxc_url = lxc_url.clone();
             let token = token.clone();
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
@@ -281,8 +285,14 @@ pub async fn bulk_clone(app: ArgMatches) -> Result<(), Box<dyn Error>> {
 }
 //Does much of the same as the aformetioned function, but deletes instead.
 pub async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
-    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
-    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let max = match app.get_one::<String>("Max").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Max needs to be a valid VMID"),
+    };
+    let min = match app.get_one::<String>("Min").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Min needs to be a valid VMID"),
+    };
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -311,8 +321,6 @@ pub async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
-            let qemu_url = qemu_url.clone();
-            let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
@@ -355,8 +363,14 @@ pub async fn bulk_destroy(app: ArgMatches) -> Result<(), Box<dyn Error>> {
 }
 
 pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
-    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
-    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let max = match app.get_one::<String>("Max").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Max needs to be a valid VMID"),
+    };
+    let min = match app.get_one::<String>("Min").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Min needs to be a valid VMID"),
+    };
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -394,9 +408,6 @@ pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
-            let checker_url = checker_url.clone();
-            let qemu_url = qemu_url.clone();
-            let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
@@ -413,8 +424,7 @@ pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
                     .unwrap();
                 match serde_json::de::from_str::<NULLData>(checker.as_str()) {
                     Ok(_) => {
-                        //If the response can correctly serialize as "Data":Null then we assume
-                        //it's qemu.
+                        //If the response can correctly serialize as "Data":Null then we assume it's qemu.
                         let qemu_request =
                             match client.post(&qemu_url).headers(token.clone()).send().await {
                                 Ok(c) => c,
@@ -455,8 +465,14 @@ pub async fn bulk_stop(app: ArgMatches) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 pub async fn bulk_start(app: ArgMatches) -> Result<(), Box<dyn Error>> {
-    let max = app.get_one::<String>("Max").unwrap().parse::<i32>()?;
-    let min = app.get_one::<String>("Min").unwrap().parse::<i32>()?;
+    let max = match app.get_one::<String>("Max").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Max needs to be a valid VMID"),
+    };
+    let min = match app.get_one::<String>("Min").unwrap().parse::<i32>() {
+        Ok(i) => i,
+        Err(_) => panic!("Min needs to be a valid VMID"),
+    };
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
         .build()?;
@@ -492,9 +508,6 @@ pub async fn bulk_start(app: ArgMatches) -> Result<(), Box<dyn Error>> {
             let url = url.clone();
             let client = client.clone();
             let name = name.clone();
-            let checker_url = checker_url.clone();
-            let qemu_url = qemu_url.clone();
-            let lxc_url = lxc_url.clone();
             let token = token.clone();
             let permit = semaphore.clone();
             tokio::spawn(async move {
