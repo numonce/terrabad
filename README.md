@@ -8,7 +8,7 @@ Terrabad currently supports single and bulk actions of cloning and starting/stop
 ```
 terrabad.exe -h 
 ```
-[Help](https://cdn.discordapp.com/attachments/898312220021260302/1145750472435703808/image.png)
+![Help](https://cdn.discordapp.com/attachments/898312220021260302/1145750472435703808/image.png)
 
 ## Examples
 
